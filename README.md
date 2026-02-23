@@ -8,3 +8,5 @@ https://github.com/zeux/pugixml/tree/master/src
 
 Testowałem na LoD1. bo akurat tam gdzie testowałem tylko taki był dostępny.
 Niestety LoD1 ma płaskie dachy i uproszczoną bryłę. Nie wiem czy zadziała z LoD2
+
+Program wymaga też pliku .ini, gdzie ustawiamy podstawowe parametry, nazwy katalogów i plików.
