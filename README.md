@@ -5,3 +5,6 @@ Pliki z danymi GML można pobrać z Geoportalu https://www.geoportal.gov.pl/
 
 Program wyamga plików pugiconfig.hpp, pugixml.cpp i pugixml.hpp. Do pobrania ba stronie
 https://github.com/zeux/pugixml/tree/master/src
+
+Testowałem na LoD1. bo akurat tam gdzie testowałem tylko taki był dostępny.
+Niestety LoD1 ma płaskie dachy i uproszczoną bryłę. Nie wiem czy zadziała z LoD2
