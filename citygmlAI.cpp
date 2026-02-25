@@ -83,7 +83,7 @@ struct Config {
 
     void print() const {
         std::cout << "=========================================\n";
-        std::cout << " citygmlAI v28\n";
+        std::cout << " citygmlAI v28.1\n";
         std::cout << "=========================================\n";
         std::cout << " Wczytana konfiguracja (citygmlAI.ini):\n";
         std::cout << "=========================================\n";
@@ -477,6 +477,8 @@ int main() {
         }
     }
     
-    std::cout << "\nZakonczono pomyslnie. Wygenerowano: " << counter - 1 << " obiektow.\n";
+    std::cout << "\nZakonczono pomyslnie. Wygenerowano: " << counter - 1 << " obiektow.\n\n";
+    std::cout << "Gotowe.\n" << "Nacisnij Enter, aby zamknac okno..." << std::endl;
+    std::cin.get();
     return 0;
 }
