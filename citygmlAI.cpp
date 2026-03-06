@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include "pugixml.hpp"
 
 namespace fs = std::filesystem;
@@ -22,6 +23,7 @@ namespace fs = std::filesystem;
 // ----------------------------------------------------------------
 struct Config {
     std::string trackFilename = "EXPORT.SCN";
+    std::string terrainFilename = "teren.scm";
     std::string inputDir = "CityGML-walbrzych";
     std::string outputFilename = "citygml.scm";
     double filterDistance = 2000.0; 
@@ -42,16 +44,13 @@ struct Config {
         
         std::string line;
         while (std::getline(file, line)) {
-            // Ignorowanie komentarzy (# lub ;)
             auto commentPos = line.find('#');
             if (commentPos == std::string::npos) commentPos = line.find(';');
             if (commentPos != std::string::npos) line = line.substr(0, commentPos);
 
-            // Usuwanie bialych znakow
             line.erase(0, line.find_first_not_of(" \t\r\n"));
             line.erase(line.find_last_not_of(" \t\r\n") + 1);
 
-            // Ignorowanie pustych linii i naglowkow sekcji
             if (line.empty() || line[0] == '[') continue;
 
             auto delim = line.find('=');
@@ -64,6 +63,7 @@ struct Config {
 
                 try {
                     if (key == "TRACK_FILENAME") trackFilename = val;
+                    else if (key == "TERRAIN_FILENAME") terrainFilename = val;
                     else if (key == "INPUT_DIR") inputDir = val;
                     else if (key == "OUTPUT_FILENAME") outputFilename = val;
                     else if (key == "FILTER_DISTANCE") filterDistance = std::stod(val);
@@ -82,21 +82,20 @@ struct Config {
     }
 
     void print() const {
-        std::cout << "=========================================\n";
-        std::cout << " citygmlAI v28.1\n";
-        std::cout << "=========================================\n";
+        std::cout << "-------------------------------------------\n";
         std::cout << " Wczytana konfiguracja (citygmlAI.ini):\n";
-        std::cout << "=========================================\n";
+        std::cout << "-------------------------------------------\n";
         std::cout << " -> Plik bazowy SCN : " << trackFilename << "\n";
+        std::cout << " -> Plik z terenem  : " << terrainFilename << "\n";
         std::cout << " -> Katalog zrodlowy: " << inputDir << "\n";
         std::cout << " -> Plik wynikowy   : " << outputFilename << "\n";
         std::cout << " -> Max Dystans     : " << filterDistance << " m\n";
         std::cout << " -> Zamiana osi X/Y : " << (swapGmlXy ? "TAK" : "NIE") << "\n";
         std::cout << " -> Min Pow. Trojkata: " << minTriangleArea << " m2\n";
-        std::cout << " -> Tekstura dachu  : " << texRoof << "\n";
-        std::cout << " -> Tekstura sciany : " << texWall << "\n";
+        std::cout << " -> Tekstura dach   : " << texRoof << "\n";
+        std::cout << " -> Tekstura scian  : " << texWall << "\n";
         std::cout << " -> Tekstura gruntu : " << texGround << "\n";
-        std::cout << "=========================================\n\n";
+        std::cout << "-------------------------------------------\n\n";
     }
 } cfg;
 
@@ -109,8 +108,8 @@ struct Vector3 { double nx, ny, nz; };
 struct PolyData {
     std::vector<Point> verts;
     Vector3 normal;
-    std::string explicitType; // Typ tekstury wprost z XML (np. RoofSurface)
-    double centerY;           // Środek wysokości do oceny czy to dach czy podłoga
+    std::string explicitType; 
+    double centerY;           
 };
 
 // ----------------------------------------------------------------
@@ -129,6 +128,112 @@ double distanceSquared2D(double x1, double z1, double x2, double z2) {
 double distSq3D(Point p1, Point p2) {
     return (p1.x - p2.x)*(p1.x - p2.x) + (p1.y - p2.y)*(p1.y - p2.y) + (p1.z - p2.z)*(p1.z - p2.z);
 }
+
+// ----------------------------------------------------------------
+// MANAGER TERENU
+// Ładuje siatkę i oblicza wysokość na zadanym koordynacie X/Z
+// ----------------------------------------------------------------
+struct TerrainTriangle {
+    Point a, b, c;
+    double minX, maxX, minZ, maxZ;
+    void calcBounds() {
+        minX = std::min({a.x, b.x, c.x}); maxX = std::max({a.x, b.x, c.x});
+        minZ = std::min({a.z, b.z, c.z}); maxZ = std::max({a.z, b.z, c.z});
+    }
+};
+
+class TerrainManager {
+    struct CellKey {
+        int x, z;
+        bool operator==(const CellKey& o) const { return x == o.x && z == o.z; }
+    };
+    struct KeyHasher {
+        size_t operator()(const CellKey& k) const {
+            return std::hash<int>()(k.x) ^ (std::hash<int>()(k.z) << 1);
+        }
+    };
+    
+    std::unordered_map<CellKey, std::vector<TerrainTriangle>, KeyHasher> grid;
+    const double CELL_SIZE = 100.0;
+
+    int getCell(double val) const { return static_cast<int>(std::floor(val / CELL_SIZE)); }
+
+    bool isPointInTriangleXZ(double px, double pz, const Point& a, const Point& b, const Point& c) const {
+        auto sign = [](double x1, double z1, double x2, double z2, double x3, double z3) {
+            return (x1 - x3) * (z2 - z3) - (x2 - x3) * (z1 - z3);
+        };
+        double d1 = sign(px, pz, a.x, a.z, b.x, b.z);
+        double d2 = sign(px, pz, b.x, b.z, c.x, c.z);
+        double d3 = sign(px, pz, c.x, c.z, a.x, a.z);
+        bool has_neg = (d1 < -0.001) || (d2 < -0.001) || (d3 < -0.001);
+        bool has_pos = (d1 >  0.001) || (d2 >  0.001) || (d3 >  0.001);
+        return !(has_neg && has_pos);
+    }
+
+    double getTriangleHeight(const TerrainTriangle& t, double x, double z) const {
+        double det = (t.b.z - t.c.z) * (t.a.x - t.c.x) + (t.c.x - t.b.x) * (t.a.z - t.c.z);
+        if (std::abs(det) < 1e-6) return std::max({t.a.y, t.b.y, t.c.y});
+        double l1 = ((t.b.z - t.c.z) * (x - t.c.x) + (t.c.x - t.b.x) * (z - t.c.z)) / det;
+        double l2 = ((t.c.z - t.a.z) * (x - t.c.x) + (t.a.x - t.c.x) * (z - t.c.z)) / det;
+        double l3 = 1.0 - l1 - l2;
+        return l1 * t.a.y + l2 * t.b.y + l3 * t.c.y;
+    }
+
+public:
+    bool load(const std::string& scnPath) {
+        std::ifstream file(scnPath);
+        if (!file.is_open()) return false;
+        std::cout << "[WCZYTYWANIE] Plik terenu: " << scnPath << "...\n";
+
+        std::string line;
+        std::vector<Point> tempVerts;
+        size_t triCount = 0;
+
+        while (std::getline(file, line)) {
+            if (line.find("node") != std::string::npos) continue;
+            if (line.find("endtri") != std::string::npos) { tempVerts.clear(); continue; }
+            
+            std::stringstream ss(line);
+            double x, y, z;
+            if (ss >> x >> y >> z) {
+                tempVerts.push_back({x, y, z});
+                if (tempVerts.size() == 3) {
+                    TerrainTriangle tri = {tempVerts[0], tempVerts[1], tempVerts[2]};
+                    tri.calcBounds();
+                    
+                    int minCx = getCell(tri.minX); int maxCx = getCell(tri.maxX);
+                    int minCz = getCell(tri.minZ); int maxCz = getCell(tri.maxZ);
+                    
+                    for (int cx = minCx; cx <= maxCx; ++cx) {
+                        for (int cz = minCz; cz <= maxCz; ++cz) {
+                            grid[{cx, cz}].push_back(tri);
+                        }
+                    }
+                    tempVerts.clear();
+                    triCount++;
+                }
+            }
+        }
+        std::cout << " -> Wczytano " << triCount << " trojkatow terenu.\n\n";
+        return true;
+    }
+
+    bool getHeightAt(double x, double z, double& outHeight) const {
+        CellKey key = {getCell(x), getCell(z)};
+        auto it = grid.find(key);
+        if (it != grid.end()) {
+            for (const auto& tri : it->second) {
+                if (x >= tri.minX && x <= tri.maxX && z >= tri.minZ && z <= tri.maxZ) {
+                    if (isPointInTriangleXZ(x, z, tri.a, tri.b, tri.c)) {
+                        outHeight = getTriangleHeight(tri, x, z);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+};
 
 // ----------------------------------------------------------------
 // Algorytm Newella do obliczania normalnych dla wielokątów
@@ -230,7 +335,6 @@ std::vector<int> triangulatePolygon(const std::vector<Point>& poly3d, Vector3 no
         }
     }
     
-    // Jeśli triangulacja się nie powiodła (np. z powodu złożonego kształtu), zwróć prosty fan
     if (indices.empty() || count > 2) {
         indices.clear();
         for (int i = 1; i < n - 1; ++i) {
@@ -296,7 +400,8 @@ public:
         return { offsetEast - geoE, geoH, geoN - offsetNorth };
     }
 
-    void processFile(const std::string& gmlPath, std::ofstream& outFile, int& globalCounter) {
+    // Dodano referencje do terrainMgr zeby moc spradzic grunt
+    void processFile(const std::string& gmlPath, std::ofstream& outFile, int& globalCounter, const TerrainManager& terrainMgr) {
         pugi::xml_document doc;
         if (!doc.load_file(gmlPath.c_str())) return;
         std::cout << "Plik: " << fs::path(gmlPath).filename().string();
@@ -305,7 +410,6 @@ public:
         int added = 0;
         
         for (auto& bNode : buildings) {
-            // ŚCIEŻKA A: LoD2 - PRIORYTET
             auto thematicNodes = bNode.node().select_nodes(".//*[local-name()='RoofSurface' or local-name()='WallSurface' or local-name()='GroundSurface' or local-name()='FloorSurface']");
             
             bool isLoD2 = (thematicNodes.size() > 0);
@@ -314,7 +418,6 @@ public:
             if (isLoD2) {
                 for (auto& t : thematicNodes) surfacesToProcess.push_back(t.node());
             } else {
-                // ŚCIEŻKA B: LoD1 - FALLBACK
                 auto solidNodes = bNode.node().select_nodes(".//*[local-name()='posList']");
                 for (auto& s : solidNodes) surfacesToProcess.push_back(s.node().parent());
             }
@@ -323,10 +426,12 @@ public:
 
             std::vector<PolyData> polys;
             double buildMinY = 1e18; 
+            double buildMinX = 1e18, buildMaxX = -1e18;
+            double buildMinZ = 1e18, buildMaxZ = -1e18;
             Point firstPoint = {0,0,0}; 
             bool firstPointSet = false;
 
-            // Etap 1: Parsowanie wierzchołków i obliczanie normalnych
+            // Faza 1: Parsowanie wierzchołków i obliczanie normalnych
             for (auto& surface : surfacesToProcess) {
                 pugi::xml_node posNode = surface.child("gml:lod2MultiSurface");
                 if (!posNode) posNode = surface;
@@ -346,8 +451,14 @@ public:
                     else p = transform(raw[i], raw[i+1], raw[i+2]);
                     p_vec.push_back(p);
                     if (!firstPointSet) { firstPoint = p; firstPointSet = true; }
+                    
                     if (p.y < buildMinY) buildMinY = p.y; 
                     if (p.y < localMinY) localMinY = p.y;
+                    
+                    if (p.x < buildMinX) buildMinX = p.x;
+                    if (p.x > buildMaxX) buildMaxX = p.x;
+                    if (p.z < buildMinZ) buildMinZ = p.z;
+                    if (p.z > buildMaxZ) buildMaxZ = p.z;
                 }
 
                 if (p_vec.size() > 3 && 
@@ -378,10 +489,27 @@ public:
             }
             if (!near) continue;
 
+            // Faza DODATKOWA: Równanie do terenu
+            double centerX = (buildMinX + buildMaxX) / 2.0;
+            double centerZ = (buildMinZ + buildMaxZ) / 2.0;
+            double terrainY = 0.0;
+            
+            // Szukamy wysokosci terenu pod srodkiem budynku
+            if (terrainMgr.getHeightAt(centerX, centerZ, terrainY)) {
+                double shiftY = terrainY - buildMinY; // Zmiana wymagana by postawic budynek na ziemi
+                for (auto& pd : polys) {
+                    pd.centerY += shiftY;
+                    for (auto& v : pd.verts) {
+                        v.y += shiftY; // Przesuwamy budynek
+                    }
+                }
+                buildMinY += shiftY; // Aktualizacja punktu zerowego budynku
+            }
+
             struct OutputMesh { std::vector<Point> v; std::vector<Vector3> n; };
             std::map<std::string, OutputMesh> groups;
 
-            // Etap 2: Teksturowanie i triangulacja
+            // Faza 2: Teksturowanie i triangulacja
             for (auto& pd : polys) {
                 std::string tex = cfg.texWall;
                 bool flipWinding = false;
@@ -418,7 +546,7 @@ public:
                 }
             }
 
-            // Etap 3: Zapisywanie do pliku'
+            // Faza 3: Zapisywanie do pliku z poprawnym formatem 'end'
             for (auto& g : groups) {
                 if (g.second.v.empty()) continue;
                 
@@ -449,19 +577,25 @@ public:
 
 int main() {
     if (!cfg.load("citygmlAI.ini")) {
-        // Zatrzymanie pracy programu jeśli plik .ini nie zostal zaladowany
         return 1;
     }
     cfg.print();
 
+    // Zaladowanie terenu do indeksu przestrzennego
+    TerrainManager terrain;
+    if (!terrain.load(cfg.terrainFilename)) {
+        std::cerr << "UWAGA: Nie udalo sie otworzyc pliku terenu: " << cfg.terrainFilename << "!\n";
+        std::cerr << "Budynki zostana wygenerowane, ale NIE zostana zrownane z siatka terenu.\n\n";
+    }
+
     CityGMLConverter conv;
     if (!conv.loadContextFromSCN(cfg.trackFilename)) {
-        std::cerr << "Nie udalo sie zaladowac pliku " << cfg.trackFilename << "\n";
+        std::cerr << "Nie udalo sie zaladowac pliku SCN " << cfg.trackFilename << "\n";
         return 1;
     }
 
     std::ofstream outFile(cfg.outputFilename);
-    outFile << "// Obiekty wygenerowano programem citygmlAI v28\n";
+    outFile << "// Wygenerowano z CityGML V29 (Z rownaniem do terenu)\n";
     
     int counter = 1;
     if (!fs::exists(cfg.inputDir)) {
@@ -473,12 +607,11 @@ int main() {
         std::string ext = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         if (ext == ".gml" || ext == ".xml") {
-            conv.processFile(entry.path().string(), outFile, counter);
+            // Przekazanie terrain managera w celu pomiaru wysokosci
+            conv.processFile(entry.path().string(), outFile, counter, terrain);
         }
     }
     
-    std::cout << "\nZakonczono pomyslnie. Wygenerowano: " << counter - 1 << " obiektow.\n\n";
-    std::cout << "Gotowe.\n" << "Nacisnij Enter, aby zamknac okno..." << std::endl;
-    std::cin.get();
+    std::cout << "\nZakonczono pomyslnie. Wygenerowano: " << counter - 1 << " obiektow.\n";
     return 0;
 }
